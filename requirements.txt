@@ -1,0 +1,32 @@
+# TradSense - Dependencies
+# Python 3.12+
+
+# Data & Analysis
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance==0.2.36
+
+# HTTP & Feeds
+requests>=2.31.0
+feedparser>=6.0.11
+
+# Database
+SQLAlchemy>=2.0.25
+
+# Scheduler
+APScheduler>=3.10.4
+
+# Telegram Bot
+python-telegram-bot>=21.0
+
+# AI / LLM - Google Gemini
+google-genai>=1.14.0
+
+# Sentiment (lightweight)
+textblob>=0.18.0
+
+# Environment
+python-dotenv>=1.0.1
+
+# Logging
+rich>=13.7.0
