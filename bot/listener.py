@@ -6,6 +6,7 @@ Menjalankan polling server agar bot bisa diakses oleh banyak pengguna secara lan
 """
 
 import logging
+import threading
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
@@ -13,6 +14,9 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
+# Flag untuk mencegah pipeline berjalan ganda
+_pipeline_running = False
 
 from config import TELEGRAM_BOT_TOKEN
 from database.models import AIAnalysis, StockFeature, Subscriber, get_session
@@ -109,7 +113,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Sistem Analisis Saham BEI Berbasis AI (Google Gemini)\n\n"
         "📢 *Perintah yang Tersedia:*\n"
         "• /start — Daftar langganan rekomendasi harian otomatis\n"
-        "• /rekomendasi — Cek analisis dan rekomendasi saham terupdate\n"
+        "• /rekomendasi — Lihat rekomendasi terupdate dari database\n"
+        "• /jalankan — ⚡ Trigger pipeline sekarang (ambil data & analisis baru)\n"
         "• /help — Tampilkan menu panduan ini\n"
         "• /stop — Berhenti mendapatkan broadcast rekomendasi harian\n\n"
         "⚠️ *Disclaimer:* Semua output bot ini adalah analisis teknikal & berita berbasis AI dan bukan ajakan finansial mengikat. Selalu lakukan riset mandiri."
@@ -213,6 +218,65 @@ async def rekomendasi_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         session.close()
 
 
+async def jalankan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Trigger pipeline secara manual via Telegram.
+
+    Menjalankan full pipeline (fetch data → filter → scoring → AI → report)
+    di background thread agar bot tetap responsif.
+    """
+    global _pipeline_running
+
+    if _pipeline_running:
+        await update.message.reply_text(
+            "⏳ Pipeline sedang berjalan, harap tunggu hingga selesai sebelum menjalankan lagi."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        "🚀 *Pipeline dimulai!*\n\n"
+        "Proses pengambilan data saham BEI sedang berjalan di background.\n"
+        "Estimasi waktu: 5–15 menit tergantung jumlah saham.\n\n"
+        "Laporan rekomendasi akan dikirim ke sini secara otomatis setelah selesai.",
+        parse_mode="Markdown",
+    )
+
+    # Ambil bot object untuk mengirim pesan dari thread background
+    bot = context.bot
+
+    def _run_pipeline_thread() -> None:
+        """Jalankan pipeline di thread terpisah."""
+        global _pipeline_running
+        _pipeline_running = True
+
+        import asyncio
+        from pipeline import TradSensePipeline
+
+        try:
+            pipeline = TradSensePipeline()
+            results = pipeline.run(skip_fetch=False)
+            msg = (
+                f"✅ Pipeline selesai! *{len(results)} saham* berhasil dianalisis.\n"
+                "Gunakan /rekomendasi untuk melihat hasilnya."
+            )
+        except Exception as e:
+            logger.error(f"Pipeline manual gagal: {e}")
+            msg = f"❌ Pipeline gagal:\n`{str(e)[:300]}`"
+        finally:
+            _pipeline_running = False
+
+        # Kirim notifikasi hasil ke chat
+        try:
+            asyncio.run(
+                bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+            )
+        except Exception as send_err:
+            logger.error(f"Gagal kirim notifikasi selesai: {send_err}")
+
+    thread = threading.Thread(target=_run_pipeline_thread, daemon=True)
+    thread.start()
+
+
 def run_listener() -> None:
     """Memulai polling listener server."""
     if not TELEGRAM_BOT_TOKEN:
@@ -227,6 +291,7 @@ def run_listener() -> None:
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rekomendasi", rekomendasi_command))
+    app.add_handler(CommandHandler("jalankan", jalankan_command))
 
     logger.info("Bot Listener berjalan dalam mode polling. Tekan Ctrl+C untuk berhenti.")
     app.run_polling()

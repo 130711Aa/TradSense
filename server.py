@@ -234,6 +234,7 @@ async def run_bot_async() -> None:
         stop_command,
         help_command,
         rekomendasi_command,
+        jalankan_command,
     )
 
     if not TELEGRAM_BOT_TOKEN:
@@ -255,6 +256,7 @@ async def run_bot_async() -> None:
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rekomendasi", rekomendasi_command))
+    app.add_handler(CommandHandler("jalankan", jalankan_command))
 
     logger.info("🤖 Bot Listener aktif — menunggu perintah Telegram...")
 
