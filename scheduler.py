@@ -4,6 +4,8 @@ TradSense - Scheduler
 APScheduler untuk menjalankan pipeline secara otomatis dua kali sehari:
 1. Pagi (Sebelum buka market, 08:30 WIB): Rekomendasi BELI_PAGI -> JUAL_SORE.
 2. Sore (Sebelum tutup market, 15:30 WIB): Rekomendasi BELI_SORE -> JUAL_PAGI.
+
+Hanya berjalan pada hari kerja (Senin-Jumat) sesuai jadwal BEI.
 """
 
 import signal
@@ -33,6 +35,14 @@ def run_session_pipeline(session_name: str) -> None:
     Args:
         session_name: Nama sesi ("BELI_PAGI" atau "BELI_SORE").
     """
+    # Pengecekan hari kerja (BEI tutup weekend)
+    from datetime import datetime
+    if datetime.now().weekday() >= 5:
+        logger.info(
+            f"⏭ Skip pipeline {session_name} — hari ini bukan hari kerja BEI."
+        )
+        return
+
     logger.info(f"⏰ Scheduler triggered - memulai pipeline sesi: {session_name}")
     try:
         pipeline = TradSensePipeline()
@@ -56,8 +66,9 @@ def main() -> None:
 
     scheduler = BlockingScheduler()
 
-    # 1. Jadwal Sesi Pagi (BELI_PAGI)
+    # 1. Jadwal Sesi Pagi (BELI_PAGI) — Senin–Jumat 08:30 WIB
     trigger_pagi = CronTrigger(
+        day_of_week="mon-fri",
         hour=SCHEDULE_PAGI_HOUR,
         minute=SCHEDULE_PAGI_MINUTE,
         timezone=SCHEDULE_TIMEZONE,
@@ -68,11 +79,12 @@ def main() -> None:
         trigger=trigger_pagi,
         id="session_pagi",
         name="TradSense Sesi Pagi",
-        misfire_grace_time=3600,
+        misfire_grace_time=300,
     )
 
-    # 2. Jadwal Sesi Sore (BELI_SORE)
+    # 2. Jadwal Sesi Sore (BELI_SORE) — Senin–Jumat 15:30 WIB
     trigger_sore = CronTrigger(
+        day_of_week="mon-fri",
         hour=SCHEDULE_SORE_HOUR,
         minute=SCHEDULE_SORE_MINUTE,
         timezone=SCHEDULE_TIMEZONE,
@@ -83,7 +95,7 @@ def main() -> None:
         trigger=trigger_sore,
         id="session_sore",
         name="TradSense Sesi Sore",
-        misfire_grace_time=3600,
+        misfire_grace_time=300,
     )
 
     # Graceful shutdown

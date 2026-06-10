@@ -4,6 +4,10 @@ TradSense - Render Deploy Server
 Server HTTP gabungan untuk deploy ke Render (Free Web Service).
 Menjalankan Web Health Check (agar Render tetap aktif), 
 Telegram Bot Listener, dan Scheduler Harian dalam satu proses.
+
+Fix:
+- misfire_grace_time dikurangi ke 300s agar restart tidak trigger job lama
+- Pengecekan hari kerja agar pipeline tidak berjalan saat weekend
 """
 
 import os
@@ -120,39 +124,64 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
         # Mute log default HTTP request agar console bersih
         pass
 
+def _is_market_day() -> bool:
+    """Cek apakah hari ini adalah hari kerja (Senin-Jumat). BEI tutup weekend."""
+    return datetime.now().weekday() < 5  # 0=Senin, 4=Jumat, 5=Sabtu, 6=Minggu
+
+
+def run_session_pipeline_safe(session_name: str) -> None:
+    """Wrapper run_session_pipeline dengan pengecekan hari kerja.
+
+    Args:
+        session_name: Nama sesi ("BELI_PAGI" atau "BELI_SORE").
+    """
+    if not _is_market_day():
+        logger.info(
+            f"⏭ Skip pipeline {session_name} — hari ini bukan hari kerja BEI "
+            f"(hari ke-{datetime.now().weekday()+1}/7)"
+        )
+        return
+    run_session_pipeline(session_name)
+
+
 def start_scheduler():
     """Menjalankan Background Scheduler."""
     logger.info("Memulai Background Scheduler...")
+    # misfire_grace_time=300 (5 menit): jika server restart dan jadwal
+    # sudah lewat > 5 menit, job dilewati — bukan dijalankan langsung.
+    # Ini mencegah eksekusi mendadak di tengah malam saat Render restart.
     scheduler = BackgroundScheduler()
 
-    # 1. Jadwal Sesi Pagi (BELI_PAGI)
+    # 1. Jadwal Sesi Pagi (BELI_PAGI) — Senin–Jumat 08:30 WIB
     trigger_pagi = CronTrigger(
+        day_of_week="mon-fri",
         hour=SCHEDULE_PAGI_HOUR,
         minute=SCHEDULE_PAGI_MINUTE,
         timezone=SCHEDULE_TIMEZONE,
     )
     scheduler.add_job(
-        run_session_pipeline,
+        run_session_pipeline_safe,
         args=["BELI_PAGI"],
         trigger=trigger_pagi,
         id="session_pagi",
         name="TradSense Sesi Pagi",
-        misfire_grace_time=3600,
+        misfire_grace_time=300,
     )
 
-    # 2. Jadwal Sesi Sore (BELI_SORE)
+    # 2. Jadwal Sesi Sore (BELI_SORE) — Senin–Jumat 15:30 WIB
     trigger_sore = CronTrigger(
+        day_of_week="mon-fri",
         hour=SCHEDULE_SORE_HOUR,
         minute=SCHEDULE_SORE_MINUTE,
         timezone=SCHEDULE_TIMEZONE,
     )
     scheduler.add_job(
-        run_session_pipeline,
+        run_session_pipeline_safe,
         args=["BELI_SORE"],
         trigger=trigger_sore,
         id="session_sore",
         name="TradSense Sesi Sore",
-        misfire_grace_time=3600,
+        misfire_grace_time=300,
     )
 
     scheduler.start()
