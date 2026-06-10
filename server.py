@@ -2,19 +2,23 @@
 TradSense - Render Deploy Server
 ================================
 Server HTTP gabungan untuk deploy ke Render (Free Web Service).
-Menjalankan Web Health Check (agar Render tetap aktif), 
+Menjalankan Web Health Check (agar Render tetap aktif),
 Telegram Bot Listener, dan Scheduler Harian dalam satu proses.
 
-Fix:
-- misfire_grace_time dikurangi ke 300s agar restart tidak trigger job lama
-- Pengecekan hari kerja agar pipeline tidak berjalan saat weekend
+Fix arsitektur:
+- HTTP health-check server dijalankan di thread terpisah
+- Bot Telegram (asyncio) dijalankan di main thread via asyncio.run()
+- Scheduler APScheduler dijalankan sebagai BackgroundScheduler
+  sebelum asyncio loop dimulai
 """
 
+import asyncio
+import http.server
 import os
 import sys
 import threading
-import http.server
 from datetime import datetime
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -30,15 +34,20 @@ from config import (
     TELEGRAM_BOT_TOKEN,
 )
 from database.models import init_db
-from bot.listener import run_listener
 from scheduler import run_session_pipeline
 from utils.logger import setup_logging, get_logger
 
 setup_logging()
 logger = get_logger("render_server")
 
+
+# ──────────────────────────────────────────────────────────────
+# Health Check HTTP Server
+# ──────────────────────────────────────────────────────────────
+
 class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
     """Handler sederhana untuk health check Render."""
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
@@ -105,7 +114,7 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
                     Sistem Analisis Saham BEI Terintegrasi
                 </p>
                 <div class="info-grid">
-                    <p>Status Bot   : <span style="color: #4ade80;">Active & Listening</span></p>
+                    <p>Status Bot   : <span style="color: #4ade80;">Active &amp; Listening</span></p>
                     <p>Timezone     : {SCHEDULE_TIMEZONE}</p>
                     <p>Beli Pagi    : {SCHEDULE_PAGI_HOUR:02d}:{SCHEDULE_PAGI_MINUTE:02d} WIB</p>
                     <p>Beli Sore    : {SCHEDULE_SORE_HOUR:02d}:{SCHEDULE_SORE_MINUTE:02d} WIB</p>
@@ -124,9 +133,23 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
         # Mute log default HTTP request agar console bersih
         pass
 
+
+def start_http_server() -> None:
+    """Menjalankan HTTP health-check server di thread terpisah."""
+    port = int(os.environ.get("PORT", 8000))
+    server_address = ("", port)
+    httpd = http.server.HTTPServer(server_address, HealthCheckHandler)
+    logger.info(f"🌐 Health Check HTTP server berjalan di port {port}")
+    httpd.serve_forever()
+
+
+# ──────────────────────────────────────────────────────────────
+# Scheduler
+# ──────────────────────────────────────────────────────────────
+
 def _is_market_day() -> bool:
     """Cek apakah hari ini adalah hari kerja (Senin-Jumat). BEI tutup weekend."""
-    return datetime.now().weekday() < 5  # 0=Senin, 4=Jumat, 5=Sabtu, 6=Minggu
+    return datetime.now().weekday() < 5  # 0=Senin, 4=Jumat
 
 
 def run_session_pipeline_safe(session_name: str) -> None:
@@ -144,12 +167,15 @@ def run_session_pipeline_safe(session_name: str) -> None:
     run_session_pipeline(session_name)
 
 
-def start_scheduler():
-    """Menjalankan Background Scheduler."""
+def start_scheduler() -> BackgroundScheduler:
+    """Menjalankan Background Scheduler dan mengembalikan instance-nya.
+
+    Returns:
+        BackgroundScheduler yang sudah berjalan.
+    """
     logger.info("Memulai Background Scheduler...")
     # misfire_grace_time=300 (5 menit): jika server restart dan jadwal
     # sudah lewat > 5 menit, job dilewati — bukan dijalankan langsung.
-    # Ini mencegah eksekusi mendadak di tengah malam saat Render restart.
     scheduler = BackgroundScheduler()
 
     # 1. Jadwal Sesi Pagi (BELI_PAGI) — Senin–Jumat 08:30 WIB
@@ -189,40 +215,89 @@ def start_scheduler():
     now = datetime.now()
     logger.info(f"Jadwal Berikutnya (Pagi): {trigger_pagi.get_next_fire_time(None, now)}")
     logger.info(f"Jadwal Berikutnya (Sore): {trigger_sore.get_next_fire_time(None, now)}")
+    return scheduler
 
-def start_bot_listener():
-    """Menjalankan Telegram Bot Listener."""
-    logger.info("Memulai Telegram Bot Listener...")
-    try:
-        run_listener()
-    except Exception as e:
-        logger.error(f"Gagal memulai Telegram Bot Listener: {e}")
 
-def main():
-    """Main entry point."""
+# ──────────────────────────────────────────────────────────────
+# Telegram Bot (async) — harus jalan di main thread asyncio loop
+# ──────────────────────────────────────────────────────────────
+
+async def run_bot_async() -> None:
+    """Menjalankan Telegram Bot Listener secara async.
+
+    Menggunakan python-telegram-bot v21+ API yang sepenuhnya async.
+    Harus dipanggil dari asyncio.run() di main thread.
+    """
+    from telegram.ext import ApplicationBuilder, CommandHandler
+    from bot.listener import (
+        start_command,
+        stop_command,
+        help_command,
+        rekomendasi_command,
+    )
+
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN belum diset — Telegram Bot tidak dijalankan.")
+        # Biarkan jalan tanpa bot (HTTP server tetap aktif via thread)
+        # Tunggu selamanya agar proses tidak exit
+        await asyncio.Event().wait()
+        return
+
+    logger.info("Memulai Telegram Bot Listener (async)...")
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("rekomendasi", rekomendasi_command))
+
+    logger.info("🤖 Bot Listener aktif — menunggu perintah Telegram...")
+
+    # Jalankan polling tanpa stop_signals agar tidak konflik
+    # dengan signal handler di main thread (Render menggunakan SIGTERM)
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        # Tunggu selamanya sampai proses dihentikan
+        await asyncio.Event().wait()
+
+        await app.updater.stop()
+        await app.stop()
+
+
+# ──────────────────────────────────────────────────────────────
+# Entry Point
+# ──────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """Main entry point untuk Render deployment."""
     init_db()
 
-    # 1. Start Scheduler di Background
-    start_scheduler()
+    # 1. HTTP Health Check — di thread daemon terpisah
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
 
-    # 2. Start Bot Listener di Thread terpisah
-    listener_thread = threading.Thread(target=start_bot_listener, daemon=True)
-    listener_thread.start()
+    # 2. APScheduler — background thread, tidak butuh asyncio
+    scheduler = start_scheduler()
 
-    # 3. Start Web Server di Main Thread untuk health check Render
-    port = int(os.environ.get("PORT", 8000))
-    server_address = ("", port)
-    httpd = http.server.HTTPServer(server_address, HealthCheckHandler)
-    
-    logger.info(f"🚀 Web Server Health Check berjalan di port {port}...")
-    logger.info("Aplikasi TradSense siap di-deploy secara gratis di Render!")
-    
+    logger.info("🚀 TradSense Server siap. Bot Listener dimulai di main thread...")
+
     try:
-        httpd.serve_forever()
+        # 3. Telegram Bot — di main thread via asyncio.run()
+        #    python-telegram-bot v21+ membutuhkan asyncio di main thread
+        asyncio.run(run_bot_async())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Mematikan server...")
-        httpd.server_close()
-        sys.exit(0)
+    finally:
+        scheduler.shutdown(wait=False)
+        logger.info("Server dihentikan.")
+
 
 if __name__ == "__main__":
     main()
