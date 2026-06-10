@@ -5,11 +5,12 @@ Mengirim laporan analisis saham ke Telegram.
 """
 
 import asyncio
+import html
+import re
 from datetime import datetime
 from typing import Any
 
-from telegram import Bot
-from telegram.constants import ParseMode
+import requests as http_requests
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_TOP_N
 from utils.logger import get_logger
@@ -24,6 +25,77 @@ STRATEGY_MAP = {
 }
 
 
+def _escape_html(text: str) -> str:
+    """Escape karakter HTML spesial untuk parse_mode=HTML."""
+    if not text:
+        return ""
+    return html.escape(str(text))
+
+
+def _send_telegram_http(token: str, chat_id: str, text: str) -> bool:
+    """Kirim pesan Telegram via requests langsung (sync, tidak butuh asyncio).
+
+    Lebih reliabel dari background thread karena tidak bergantung pada
+    asyncio event loop yang hanya tersedia di main thread.
+
+    Args:
+        token: Telegram bot token.
+        chat_id: Target chat ID.
+        text: Teks pesan (HTML format).
+
+    Returns:
+        True jika berhasil.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    # Kirim dalam chunks jika terlalu panjang
+    chunks = _split_message(text, 4000)
+    success = True
+    for chunk in chunks:
+        try:
+            resp = http_requests.post(
+                url,
+                json={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                },
+                timeout=30,
+            )
+            if not resp.ok:
+                # Fallback: coba kirim tanpa parse_mode jika HTML error
+                resp2 = http_requests.post(
+                    url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": re.sub(r"<[^>]+>", "", chunk),  # strip HTML tags
+                    },
+                    timeout=30,
+                )
+                if not resp2.ok:
+                    logger.error(f"Telegram send gagal: {resp2.text[:200]}")
+                    success = False
+        except Exception as e:
+            logger.error(f"Telegram HTTP error: {e}")
+            success = False
+    return success
+
+
+def _split_message(text: str, max_len: int = 4000) -> list[str]:
+    """Split pesan panjang menjadi beberapa bagian."""
+    parts = []
+    lines = text.split("\n")
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > max_len:
+            parts.append(current)
+            current = line
+        else:
+            current += "\n" + line if current else line
+    if current:
+        parts.append(current)
+    return parts
+
+
 class TelegramReporter:
     """Mengirim laporan analisis ke Telegram."""
 
@@ -34,12 +106,11 @@ class TelegramReporter:
     ) -> None:
         self.token = token or TELEGRAM_BOT_TOKEN
         self.chat_id = chat_id or TELEGRAM_CHAT_ID
-        self.bot = Bot(token=self.token) if self.token else None
 
     def _format_single_stock(
         self, rank: int, analysis: dict[str, Any]
     ) -> str:
-        ticker = analysis["ticker"]
+        ticker = _escape_html(analysis["ticker"])
         strategy = analysis.get("strategy", "TIDAK_DIREKOMENDASIKAN")
         confidence = analysis.get("confidence", 0)
         score = analysis.get("score", 0)
@@ -48,11 +119,12 @@ class TelegramReporter:
         emoji, label = STRATEGY_MAP.get(
             strategy, ("❓", strategy)
         )
+        label_safe = _escape_html(label)
 
-        # Rangkuman Analisis dari AI
-        analysis_text = analysis.get("analysis_text", "")
-        opportunity_text = analysis.get("opportunity_summary", "")
-        risk_text = analysis.get("risk_summary", "")
+        # Rangkuman Analisis dari AI — escape HTML
+        analysis_text = _escape_html(analysis.get("analysis_text", ""))
+        opportunity_text = _escape_html(analysis.get("opportunity_summary", ""))
+        risk_text = _escape_html(analysis.get("risk_summary", ""))
 
         # Format Opportunity / Alasan Positif
         opp_lines = []
@@ -65,7 +137,7 @@ class TelegramReporter:
             opp_lines.append(f"• {analysis_text[:120]}...")
         opp_display = "\n".join(opp_lines[:3]) if opp_lines else "• Sinyal teknikal standar"
 
-        # Format Risiko / Alasan Penolakan
+        # Format Risiko
         risk_lines = []
         if risk_text:
             for line in risk_text.split("\n"):
@@ -89,22 +161,22 @@ class TelegramReporter:
         msg = f"""
 {'━' * 32}
 
-*#{rank} {ticker}* {emoji}
+<b>#{rank} {ticker}</b> {emoji}
 
-📊 *Score:* {score:.0f}/100
-💰 *Harga:* Rp {price:,.0f}
+📊 <b>Score:</b> {score:.0f}/100
+💰 <b>Harga:</b> Rp {price:,.0f}
 
-🎯 *Strategi:*
-{label} (Confidence: {confidence}%)
+🎯 <b>Strategi:</b>
+{label_safe} (Confidence: {confidence}%)
 
-📈 *RSI:* {rsi:.0f} | *ATR:* {atr_pct:.1f}%
-📰 *Sentimen Berita:*
+📈 <b>RSI:</b> {rsi:.0f} | <b>ATR:</b> {atr_pct:.1f}%
+📰 <b>Sentimen Berita:</b>
 {sentiment_display}
 
-✅ *Potensi / Katalis:*
+✅ <b>Potensi / Katalis:</b>
 {opp_display}
 
-⚠️ *Risiko / Peringatan:*
+⚠️ <b>Risiko / Peringatan:</b>
 {risk_display}
 """
         return msg.strip()
@@ -125,36 +197,35 @@ class TelegramReporter:
                 a for a in recommended
                 if a.get("strategy") == "BELI_SORE_JUAL_PAGI"
             ]
-            title = "🌅 *REKOMENDASI BELI SORE (JUAL PAGI)*"
-            subtitle = "_Analisis otomatis menjelang market close_"
+            title = "🌅 <b>REKOMENDASI BELI SORE (JUAL PAGI)</b>"
+            subtitle = "<i>Analisis otomatis menjelang market close</i>"
         elif strategy_filter == "BELI_PAGI":
             filtered = [
                 a for a in recommended
                 if a.get("strategy") == "BELI_PAGI_JUAL_SORE"
             ]
-            title = "☀️ *REKOMENDASI BELI PAGI (JUAL SORE)*"
-            subtitle = "_Analisis otomatis menjelang market open_"
+            title = "☀️ <b>REKOMENDASI BELI PAGI (JUAL SORE)</b>"
+            subtitle = "<i>Analisis otomatis menjelang market open</i>"
         else:
             filtered = recommended
-            title = "📈 *TOP REKOMENDASI HARI INI*"
-            subtitle = "_Analisis otomatis sistem AI TradSense_"
+            title = "📈 <b>TOP REKOMENDASI HARI INI</b>"
+            subtitle = "<i>Analisis otomatis sistem AI TradSense</i>"
 
         top = filtered[:TELEGRAM_TOP_N]
         is_fallback_view = False
 
         if not top:
-            # Jika tidak ada rekomendasi beli aktif, tampilkan 5 kandidat teratas yang dianalisis sebagai referensi watchlist
             top = [a for a in analyses if a.get("ticker") is not None][:TELEGRAM_TOP_N]
             is_fallback_view = True
 
         if is_fallback_view:
             header = f"""
-⚠️ *ALERT: HIGH RISK MARKET*
+⚠️ <b>ALERT: HIGH RISK MARKET</b>
 {title}
 🗓 {now}
 {'━' * 32}
 
-*Tidak ada saham yang memenuhi kriteria rekomendasi aman saat ini.*
+<b>Tidak ada saham yang memenuhi kriteria rekomendasi aman saat ini.</b>
 Berikut adalah analisis 5 kandidat teratas sebagai referensi pantauan Anda (Watchlist):
 """
         else:
@@ -163,7 +234,7 @@ Berikut adalah analisis 5 kandidat teratas sebagai referensi pantauan Anda (Watc
 🗓 {now}
 {'━' * 32}
 
-_Sistem AI TradSense_
+<i>Sistem AI TradSense</i>
 {subtitle}
 """
 
@@ -176,10 +247,10 @@ _Sistem AI TradSense_
         footer = f"""
 {'━' * 32}
 
-⚠️ *DISCLAIMER:*
-_Rekomendasi ini dibuat oleh AI dan bukan merupakan ajakan untuk membeli/menjual saham. Investasi saham mengandung risiko. Lakukan riset mandiri sebelum mengambil keputusan._
+⚠️ <b>DISCLAIMER:</b>
+<i>Rekomendasi ini dibuat oleh AI dan bukan merupakan ajakan untuk membeli/menjual saham. Investasi saham mengandung risiko. Lakukan riset mandiri sebelum mengambil keputusan.</i>
 
-🤖 _Powered by TradSense AI_
+🤖 <i>Powered by TradSense AI</i>
 """
 
         full_report = header.strip() + "\n"
@@ -189,39 +260,16 @@ _Rekomendasi ini dibuat oleh AI dan bukan merupakan ajakan untuk membeli/menjual
 
         return full_report
 
-    async def _send_message(self, chat_id: str, text: str) -> bool:
-        if not self.bot or not chat_id:
-            logger.error("Telegram bot atau chat_id belum dikonfigurasi")
-            return False
-
-        try:
-            # Telegram max message = 4096 chars
-            if len(text) <= 4096:
-                await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            else:
-                # Split menjadi beberapa pesan
-                parts = self._split_message(text, 4000)
-                for part in parts:
-                    await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=part,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-            logger.info(f"✓ Laporan terkirim ke chat_id: {chat_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Telegram send error untuk chat_id {chat_id}: {e}")
-            return False
-
     def send_report(
         self, analyses: list[dict[str, Any]], strategy_filter: str | None = None
     ) -> bool:
+        """Kirim laporan ke semua subscriber via HTTP langsung (sync, thread-safe)."""
         report = self.format_report(analyses, strategy_filter=strategy_filter)
         logger.info(f"Mengirim laporan ({len(report)} chars)...")
+
+        if not self.token:
+            logger.error("TELEGRAM_BOT_TOKEN tidak tersedia")
+            return False
 
         # Ambil semua subscriber aktif dari database
         from database.models import Subscriber, get_session
@@ -246,48 +294,28 @@ _Rekomendasi ini dibuat oleh AI dan bukan merupakan ajakan untuk membeli/menjual
 
         success = True
         for cid in chat_ids:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        future = pool.submit(
-                            asyncio.run, self._send_message(cid, report)
-                        )
-                        res = future.result(timeout=30)
-                else:
-                    res = asyncio.run(self._send_message(cid, report))
-                if not res:
-                    success = False
-            except Exception as e:
-                logger.error(f"Gagal mengirim ke chat_id {cid}: {e}")
+            ok = _send_telegram_http(self.token, cid, report)
+            if ok:
+                logger.info(f"✓ Laporan terkirim ke chat_id: {cid}")
+            else:
+                logger.error(f"Gagal mengirim ke chat_id: {cid}")
                 success = False
+
         return success
 
     def send_error_alert(self, error_msg: str) -> bool:
-        text = (
-            f"🚨 *TradSense Error Alert*\n\n"
-            f"Terjadi error saat menjalankan pipeline:\n\n"
-            f"`{error_msg[:500]}`\n\n"
-            f"_Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S WIB')}_"
-        )
-        try:
-            return asyncio.run(self._send_message(self.chat_id, text))
-        except Exception as e:
-            logger.error(f"Failed to send error alert: {e}")
+        """Kirim error alert ke admin (sync, thread-safe)."""
+        if not self.token or not self.chat_id:
             return False
+        text = (
+            f"🚨 <b>TradSense Error Alert</b>\n\n"
+            f"Terjadi error saat menjalankan pipeline:\n\n"
+            f"<code>{_escape_html(error_msg[:500])}</code>\n\n"
+            f"<i>Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S WIB')}</i>"
+        )
+        return _send_telegram_http(self.token, self.chat_id, text)
 
     @staticmethod
     def _split_message(text: str, max_len: int = 4000) -> list[str]:
-        parts = []
-        lines = text.split("\n")
-        current = ""
-        for line in lines:
-            if len(current) + len(line) + 1 > max_len:
-                parts.append(current)
-                current = line
-            else:
-                current += "\n" + line if current else line
-        if current:
-            parts.append(current)
-        return parts
+        """Split pesan panjang menjadi beberapa bagian."""
+        return _split_message(text, max_len)

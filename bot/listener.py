@@ -203,17 +203,21 @@ async def rekomendasi_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         reporter = TelegramReporter()
         report = reporter.format_report(analyses_list)
 
-        # Telegram max length handling
+        # Telegram max length handling — gunakan HTML parse_mode (lebih aman dari Markdown)
         if len(report) <= 4096:
-            await update.message.reply_text(report, parse_mode="Markdown")
+            await update.message.reply_text(report, parse_mode="HTML")
         else:
-            parts = reporter._split_message(report, 4000)
+            from bot.telegram_reporter import _split_message
+            parts = _split_message(report, 4000)
             for part in parts:
-                await update.message.reply_text(part, parse_mode="Markdown")
+                await update.message.reply_text(part, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Error in rekomendasi_command: {e}")
-        await update.message.reply_text("Gagal memuat rekomendasi saham saat ini.")
+        try:
+            await update.message.reply_text(f"Gagal memuat rekomendasi: {str(e)[:200]}")
+        except Exception:
+            pass
     finally:
         session.close()
 
@@ -249,27 +253,26 @@ async def jalankan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         global _pipeline_running
         _pipeline_running = True
 
-        import asyncio
         from pipeline import TradSensePipeline
+        from bot.telegram_reporter import _send_telegram_http
+        from config import TELEGRAM_BOT_TOKEN
 
         try:
             pipeline = TradSensePipeline()
             results = pipeline.run(skip_fetch=False)
             msg = (
-                f"✅ Pipeline selesai! *{len(results)} saham* berhasil dianalisis.\n"
+                f"✅ <b>Pipeline selesai!</b> <b>{len(results)} saham</b> berhasil dianalisis.\n"
                 "Gunakan /rekomendasi untuk melihat hasilnya."
             )
         except Exception as e:
             logger.error(f"Pipeline manual gagal: {e}")
-            msg = f"❌ Pipeline gagal:\n`{str(e)[:300]}`"
+            msg = f"❌ Pipeline gagal:\n<code>{str(e)[:300]}</code>"
         finally:
             _pipeline_running = False
 
-        # Kirim notifikasi hasil ke chat
+        # Kirim notifikasi via HTTP langsung — tidak butuh asyncio event loop
         try:
-            asyncio.run(
-                bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-            )
+            _send_telegram_http(TELEGRAM_BOT_TOKEN, str(chat_id), msg)
         except Exception as send_err:
             logger.error(f"Gagal kirim notifikasi selesai: {send_err}")
 
